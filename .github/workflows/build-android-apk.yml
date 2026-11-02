@@ -196,6 +196,45 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo check --locked -v 2>&1 | tail -n 60
 
+      - name: Configure bindgen for Android cross-compile
+        if: steps.profile.outputs.rust == 'true'
+        run: |
+          set -euo pipefail
+          # btls-sys 用 bindgen 处理 BoringSSL 头文件。bindgen 是独立进程，不继承
+          # cc-rs 推导出的 CC_<target>/CFLAGS_<target>，缺少 --target 与 sysroot 时
+          # 会拿 host 头文件去解析 Android 目标，于是 uint32_t/int32_t 全部未定义：
+          #   bits/pthread_types.h:35:3: error: unknown type name 'uint32_t'
+          # 这里按 target triple 逐个补上，bindgen 会按 BINDGEN_EXTRA_CLANG_ARGS_<triple>
+          # 精确匹配，避免污染 host 上的 cargo check。
+          NDK="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          SYSROOT="$TOOLCHAIN/sysroot"
+          test -d "$SYSROOT/usr/include" || { echo "missing sysroot: $SYSROOT"; exit 1; }
+
+          declare -A TRIPLES=(
+            [aarch64-linux-android]="aarch64-linux-android"
+            [armv7-linux-androideabi]="armv7a-linux-androideabi"
+            [x86_64-linux-android]="x86_64-linux-android"
+          )
+          for rust_target in "${!TRIPLES[@]}"; do
+            clang_target="${TRIPLES[$rust_target]}"
+            args="--target=${clang_target}24 -isystem ${SYSROOT}/usr/include -isystem ${SYSROOT}/usr/include/${clang_target}"
+            echo "BINDGEN_EXTRA_CLANG_ARGS_${rust_target}=${args}"
+            {
+              echo "BINDGEN_EXTRA_CLANG_ARGS_${rust_target}=${args}"
+              # 下划线版本，兼容把 - 转成 _ 的 target 读取方式
+              echo "BINDGEN_EXTRA_CLANG_ARGS_${rust_target//-/_}=${args}"
+            } >> "$GITHUB_ENV"
+          done
+
+          # btls-sys 通过 libclang 生成绑定，指向 NDK 自带的 clang 以免版本错配
+          LIB="$TOOLCHAIN/lib"
+          {
+            echo "LIBCLANG_PATH=${LIB}"
+            echo "CLANG_PATH=${TOOLCHAIN}/bin/clang"
+          } >> "$GITHUB_ENV"
+          ls "$LIB"/libclang* || true
+
       - name: Build release APK
         env:
           # cargokit 读取该变量确定要构建的 Rust target；留空则构建全部
