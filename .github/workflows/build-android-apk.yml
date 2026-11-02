@@ -1,0 +1,224 @@
+name: Build Android APK
+
+# hikari_novel_flutter —— 面向上游 15dd/hikari_novel_flutter 的构建流水线。
+#
+# 本工作流同时支持两条构建基线，靠仓库里是否出现 rust/Cargo.toml 自动切换：
+#   * main / master         纯 Flutter + Gradle
+#   * refactor/cloudflare_bypass
+#                           额外引入 rust_builder + cargokit，Rust crate `hikari_http`
+#                           用 wreq 复刻 Chrome136 的 TLS 指纹以穿过 Cloudflare。
+#                           该分支必须走 Rust 构建，否则 wenku8 会在 TLS 握手阶段
+#                           直接断开（Dio 报 "Connection closed before full header"）。
+#
+# 上游把 android/{gradlew,gradlew.bat,gradle/wrapper/gradle-wrapper.jar} 全部列进了
+# android/.gitignore，所以每次 checkout 这三个文件都是缺失的；`flutter build apk`
+# 会在调用 ./gradlew 时直接失败。本工作流在构建前从 Flutter SDK 自带的
+# gradle_wrapper artifact 补回 wrapper，与 gradle-wrapper.properties 声明的
+# Gradle 9.3.1 版本对齐。
+#
+# 版本约束来自仓库自身而非猜测：
+#   pubspec.yaml         -> sdk: ^3.12.2, flutter_rust_bridge: 2.11.1
+#   pubspec.lock         -> flutter: ">=3.44.0"
+#   settings.gradle.kts  -> AGP 9.1.0, Kotlin 2.4.0
+#   gradle-wrapper.properties -> gradle-9.3.1-all
+#   rust/Cargo.toml      -> edition 2021, wreq =0.16.1, wreq-util =0.2.0
+
+on:
+  workflow_dispatch:
+    inputs:
+      flutter-version:
+        description: 'Flutter 版本（留空则用下方 env 里的锁定值）'
+        required: false
+        default: ''
+      split-per-abi:
+        description: '按 ABI 分包（arm64-v8a / armeabi-v7a / x86_64）'
+        type: boolean
+        default: false
+  push:
+    branches: [main, master, cf-bypass]
+    paths-ignore:
+      - '**/*.md'
+      - 'readme/**'
+  pull_request:
+
+concurrency:
+  group: build-android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 锁定版本，避免 stable 通道漂移导致某天突然构建失败
+  FLUTTER_VERSION: ${{ inputs.flutter-version || '3.47.9' }}
+  # NDK 由 android/app/build.gradle.kts 的 flutter.ndkVersion 决定，
+  # 这里只在预装的 NDK 不匹配时兜底安装
+  NDK_VERSION: '28.2.13676358'
+  CMAKE_VERSION: '3.22.1'
+  # flutter_rust_bridge 官方要求的 Rust channel
+  RUST_VERSION: '1.85.0'
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Detect build profile
+        id: profile
+        run: |
+          set -euo pipefail
+          if [ -f rust/Cargo.toml ]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "profile=flutter+rust" >> "$GITHUB_OUTPUT"
+            echo "Detected Rust layer: rust/Cargo.toml present"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+            echo "profile=flutter-only" >> "$GITHUB_OUTPUT"
+            echo "No rust/Cargo.toml, building Flutter only"
+          fi
+
+      - name: Verify toolchain
+        run: |
+          set -euo pipefail
+          flutter --version
+          dart --version
+          java -version
+          echo "build profile = ${{ steps.profile.outputs.profile }}"
+
+      # cargokit 通过 rustup 查找 toolchain，缺了会在 Gradle 里报 rustup 不存在
+      - name: Set up Rust toolchain
+        if: steps.profile.outputs.rust == 'true'
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION"
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          # cargokit 按 Flutter 目标平台映射到这些 Rust target
+          rustup target add \
+            aarch64-linux-android \
+            armv7-linux-androideabi \
+            x86_64-linux-android
+          rustc --version
+          cargo --version
+          rustup target list --installed
+
+      # 关键修复：上游 .gitignore 排除了 gradlew 与 gradle-wrapper.jar
+      - name: Restore Gradle wrapper
+        run: |
+          set -euo pipefail
+          DEST="$GITHUB_WORKSPACE/android"
+          SRC="$FLUTTER_ROOT/bin/cache/artifacts/gradle_wrapper"
+
+          WANTED="$(grep -oE 'gradle-[0-9]+\.[0-9]+(\.[0-9]+)?' "$DEST/gradle/wrapper/gradle-wrapper.properties" | head -n1 || true)"
+          echo "gradle-wrapper.properties requests: ${WANTED:-<not found>}"
+
+          mkdir -p "$DEST/gradle/wrapper"
+
+          if [ -f "$SRC/gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "Copying the gradle wrapper bundled with the Flutter SDK"
+            cp -f "$SRC/gradlew" "$DEST/gradlew"
+            cp -f "$SRC/gradlew.bat" "$DEST/gradlew.bat"
+            cp -f "$SRC/gradle/wrapper/gradle-wrapper.jar" "$DEST/gradle/wrapper/gradle-wrapper.jar"
+          else
+            echo "Flutter SDK has no bundled wrapper, generating one"
+            VER="${WANTED#gradle-}"
+            mkdir -p /tmp/wrapgen && cd /tmp/wrapgen
+            printf '// placeholder so `gradle wrapper` accepts this directory\n' > settings.gradle.kts
+            if command -v gradle >/dev/null 2>&1; then
+              gradle wrapper --gradle-version "${VER:-9.3.1}" --distribution-type all
+            else
+              curl -fsSL -o /tmp/gradle.zip "https://services.gradle.org/distributions/gradle-${VER:-9.3.1}-bin.zip"
+              unzip -q /tmp/gradle.zip -d /tmp
+              "/tmp/gradle-${VER:-9.3.1}/bin/gradle" wrapper --gradle-version "${VER:-9.3.1}" --distribution-type all
+            fi
+            cp -f /tmp/wrapgen/gradlew /tmp/wrapgen/gradlew.bat "$DEST/"
+            cp -f /tmp/wrapgen/gradle/wrapper/gradle-wrapper.jar "$DEST/gradle/wrapper/"
+          fi
+
+          chmod +x "$DEST/gradlew"
+          ls -l "$DEST/gradlew" "$DEST/gradlew.bat" "$DEST/gradle/wrapper/gradle-wrapper.jar"
+          cat "$DEST/gradle/wrapper/gradle-wrapper.properties"
+
+      - name: Install NDK / CMake if required
+        run: |
+          set -uo pipefail
+          SDKMAN="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMAN" ]; then
+            echo "sdkmanager not found at $SDKMAN"
+            exit 1
+          fi
+          if [ -d "$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" ]; then
+            echo "NDK $NDK_VERSION already present"
+          else
+            echo "Installing NDK $NDK_VERSION and CMake $CMAKE_VERSION"
+            # Accept licenses up front. Piping `yes` into sdkmanager breaks under
+            # `set -o pipefail`: sdkmanager stops reading once it has enough input,
+            # `yes` then dies on SIGPIPE, and the pipeline reports failure even
+            # though the install itself succeeded.
+            "$SDKMAN" --licenses < /dev/null > /dev/null 2>&1 || true
+            "$SDKMAN" --install "ndk;$NDK_VERSION" "cmake;$CMAKE_VERSION" < /dev/null
+          fi
+          ls "$ANDROID_SDK_ROOT/ndk" || true
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      # 校验 Rust 侧能独立编译通过，避免把 Gradle 的报错埋在 cargokit 输出里
+      - name: cargo check (rust layer)
+        if: steps.profile.outputs.rust == 'true'
+        working-directory: rust
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo check --locked -v 2>&1 | tail -n 60
+
+      - name: Build release APK
+        env:
+          # cargokit 读取该变量确定要构建的 Rust target；留空则构建全部
+          CARGO_BUILD_TARGET: ''
+        run: |
+          set -euo pipefail
+          EXTRA=""
+          if [ "${{ inputs.split-per-abi }}" = "true" ]; then
+            EXTRA="--split-per-abi"
+          fi
+          if [ "${{ steps.profile.outputs.rust }}" = "true" ]; then
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          flutter build apk --release $EXTRA 2>&1 | tee /tmp/build.log
+
+      - name: List output
+        if: always()
+        run: |
+          ls -l build/app/outputs/flutter-apk/ 2>/dev/null || echo "no apk output dir"
+          sha256sum build/app/outputs/flutter-apk/*.apk 2>/dev/null || true
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hikari_novel_flutter-release-apk
+          path: |
+            build/app/outputs/flutter-apk/*.apk
+            /tmp/build.log
+          if-no-files-found: warn
+          retention-days: 14
