@@ -52,8 +52,13 @@ env:
   # 这里只在预装的 NDK 不匹配时兜底安装
   NDK_VERSION: '28.2.13676358'
   CMAKE_VERSION: '3.22.1'
-  # flutter_rust_bridge 官方要求的 Rust channel
-  RUST_VERSION: '1.85.0'
+  # 由 rust/Cargo.lock 里的 MSRV 反推，不是猜的：
+  #   wreq        =0.16.1  -> rustc 1.98
+  #   wreq-util   =0.2.0   -> rustc 1.98
+  #   time        =0.3.55  -> rustc 1.88.0
+  #   icu_*       =2.3.x   -> rustc 1.88
+  # 取最高者，留 minor 余量
+  RUST_VERSION: '1.98.0'
 
 jobs:
   build-android:
